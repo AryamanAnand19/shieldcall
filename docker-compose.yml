@@ -1,0 +1,138 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: shieldcall-db
+    environment:
+      POSTGRES_USER: shield_user
+      POSTGRES_PASSWORD: shield_password
+      POSTGRES_DB: shieldcall
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db_scripts:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shield_user -d shieldcall"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: shieldcall-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  user-api:
+    build:
+      context: ./backend
+      dockerfile: user_api/Dockerfile
+    container_name: shieldcall-user-api
+    ports:
+      - "8000:8000"
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DB_DSN: postgres://shield_user:shield_password@postgres:5432/shieldcall
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  detection-api:
+    build:
+      context: ./backend
+      dockerfile: detection_api/Dockerfile
+    container_name: shieldcall-detection
+    ports:
+      - "8001:8001"
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DB_DSN: postgres://shield_user:shield_password@postgres:5432/shieldcall
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  nid-service:
+    build:
+      context: ./backend
+      dockerfile: nid_service/Dockerfile
+    container_name: shieldcall-nid
+    ports:
+      - "8002:8002"
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DB_DSN: postgres://shield_user:shield_password@postgres:5432/shieldcall
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  shield-service:
+    build:
+      context: ./backend
+      dockerfile: shield_service/Dockerfile
+    container_name: shieldcall-shield
+    ports:
+      - "8003:8003"
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DB_DSN: postgres://shield_user:shield_password@postgres:5432/shieldcall
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  community-api:
+    build:
+      context: ./backend
+      dockerfile: community_api/Dockerfile
+    container_name: shieldcall-community
+    ports:
+      - "8005:8005"
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DB_DSN: postgres://shield_user:shield_password@postgres:5432/shieldcall
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  telephony:
+    build:
+      context: ./telephony
+    container_name: shieldcall-telephony
+    ports:
+      - "5066:5066/udp"
+      - "5066:5066/tcp"
+      - "10000-10010:10000-10010/udp"
+    volumes:
+      - ./telephony/conf:/etc/asterisk
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - detection-api
+    restart: always
+
+volumes:
+  pgdata:
+  redisdata:
