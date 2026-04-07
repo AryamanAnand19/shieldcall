@@ -17,9 +17,21 @@ import asyncpg
 
 app = FastAPI(title="ShieldCall Shield Service")
 
-REDIS_URL    = os.getenv("REDIS_URL",    "redis://localhost:6379/0")
-DB_DSN       = os.getenv("DB_DSN",       "postgres://shield_user:shield_password@localhost:5432/shieldcall")
-ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY")
+REDIS_URL     = os.getenv("REDIS_URL",    "redis://localhost:6379/0")
+DB_DSN        = os.getenv("DB_DSN",       "postgres://shield_user:shield_password@localhost:5432/shieldcall")
+ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+
+# Mock mode: active when no real key is provided
+MOCK_MODE = not ANTHROPIC_KEY or ANTHROPIC_KEY.startswith("sk-ant-replace")
+
+MOCK_RESPONSES = [
+    "Thank you for calling. Could I get your name and the reason for your call?",
+    "I see. Can you tell me a bit more about that?",
+    "Got it. And who should I say is calling?",
+    "Thank you. One moment while I check if they're available.",
+    "I'll pass your message along. Is there a number you can be reached at?",
+]
+_mock_turn = 0
 
 redis_pool = None
 db_pool    = None
@@ -31,7 +43,8 @@ async def startup():
     global redis_pool, db_pool, claude
     redis_pool = redis.from_url(REDIS_URL, decode_responses=True)
     db_pool    = await asyncpg.create_pool(DB_DSN, min_size=2, max_size=10)
-    claude     = anthropic.AsyncAnthropic(api_key=ANTHROPIC_KEY)
+    if not MOCK_MODE:
+        claude = anthropic.AsyncAnthropic(api_key=ANTHROPIC_KEY)
 
 
 @app.on_event("shutdown")
@@ -266,29 +279,44 @@ async def speak(session_id: str, body: SpeakEvent):
 
     # Stream Claude response, accumulate full text
     agent_reply = ""
-    async with db_pool.acquire() as conn:
-        async with claude.messages.stream(
-            model="claude-opus-4-6",
-            max_tokens=512,
-            thinking={"type": "adaptive"},
-            system=system,
-            messages=history,
-        ) as stream:
-            async for text_chunk in stream.text_stream:
-                agent_reply += text_chunk
-                await _broadcast(session_id, {
-                    "type": "agent_chunk", "text": text_chunk, "ts": ts
-                })
+    agent_ts = time.time()
 
-        # Store the complete agent utterance
-        agent_ts = time.time()
-        await _store_utterance(session_id, "agent", agent_reply, agent_ts, conn)
+    if MOCK_MODE:
+        # Return scripted mock responses without calling Claude
+        global _mock_turn
+        agent_reply = MOCK_RESPONSES[_mock_turn % len(MOCK_RESPONSES)]
+        _mock_turn += 1
+        await _broadcast(session_id, {
+            "type": "agent_chunk", "text": agent_reply, "ts": ts
+        })
+    else:
+        async with db_pool.acquire() as conn:
+            async with claude.messages.stream(
+                model="claude-opus-4-6",
+                max_tokens=512,
+                thinking={"type": "adaptive"},
+                system=system,
+                messages=history,
+            ) as stream:
+                async for text_chunk in stream.text_stream:
+                    agent_reply += text_chunk
+                    await _broadcast(session_id, {
+                        "type": "agent_chunk", "text": text_chunk, "ts": ts
+                    })
+
+            agent_ts = time.time()
+            async with db_pool.acquire() as conn:
+                await _store_utterance(session_id, "agent", agent_reply, agent_ts, conn)
+
+    if MOCK_MODE:
+        async with db_pool.acquire() as conn:
+            await _store_utterance(session_id, "agent", agent_reply, agent_ts, conn)
 
     await _broadcast(session_id, {
         "type": "utterance", "speaker": "agent", "text": agent_reply, "ts": agent_ts
     })
 
-    return {"status": "ok", "agent_reply": agent_reply}
+    return {"status": "ok", "agent_reply": agent_reply, "mock": MOCK_MODE}
 
 
 # ─── WebSocket Transcript Stream ─────────────────────────────────────────────
@@ -370,23 +398,30 @@ async def get_summary(call_id: str):
         f"{r['speaker'].upper()}: {r['text']}" for r in rows
     )
 
-    response = await claude.messages.create(
-        model="claude-opus-4-6",
-        max_tokens=512,
-        thinking={"type": "adaptive"},
-        messages=[{
-            "role": "user",
-            "content": (
-                "Summarise this phone call transcript in 2–4 sentences. "
-                "Include: caller intent, key information gathered, and outcome/disposition.\n\n"
-                f"TRANSCRIPT:\n{transcript_text}"
-            )
-        }]
-    )
-
-    summary = next(
-        (b.text for b in response.content if hasattr(b, "text")), ""
-    )
+    if MOCK_MODE:
+        turns = len(rows)
+        summary = (
+            f"[MOCK SUMMARY] Call had {turns} turn(s). "
+            "Caller intent was unclear. Agent gathered basic information. "
+            "Call ended without escalation to the user."
+        )
+    else:
+        response = await claude.messages.create(
+            model="claude-opus-4-6",
+            max_tokens=512,
+            thinking={"type": "adaptive"},
+            messages=[{
+                "role": "user",
+                "content": (
+                    "Summarise this phone call transcript in 2–4 sentences. "
+                    "Include: caller intent, key information gathered, and outcome/disposition.\n\n"
+                    f"TRANSCRIPT:\n{transcript_text}"
+                )
+            }]
+        )
+        summary = next(
+            (b.text for b in response.content if hasattr(b, "text")), ""
+        )
 
     # Persist summary
     async with db_pool.acquire() as conn:
@@ -414,7 +449,7 @@ async def health():
         result["db"] = "ok"
     except Exception as e:
         result["db"] = str(e)
-    result["claude"] = "ok" if claude else "not configured"
+    result["claude"] = "mock (no API key)" if MOCK_MODE else "ok"
     if any(v not in ("ok", "not configured") for v in [result["redis"], result["db"]]):
         result["status"] = "degraded"
     return result
